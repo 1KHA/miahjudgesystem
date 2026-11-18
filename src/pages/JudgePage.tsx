@@ -7,16 +7,21 @@ import {
 import { supabase } from '../lib/supabase';
 import {
   getSessionDetail, getSession, getOrCreateJudge, getJudge, upsertAnswer,
-  getJudgeAnswersForTeam, touchJudge
+  getJudgeAnswersForTeam, getJudgesBySession, touchJudge
 } from '../lib/supabaseService';
 import { normalizeSessionParam } from '../lib/sessionRouting';
 import { OfflineAnswerQueue, browserStorage } from '../lib/offlineQueue';
 import { RealtimeManager } from '../lib/realtimeManager';
 import { healthStore } from '../lib/connectionHealth';
 import { useConnectionHealth } from '../hooks/useConnectionHealth';
-import type { Question, SessionDetail, Session, PendingAnswer } from '../types';
+import type { Question, QuestionChoice, SessionDetail, Session, PendingAnswer } from '../types';
 
-/** Poll interval for team/status changes; the safety net behind the two realtime paths. */
+/**
+ * Session check interval while the live connection is DOWN. While it is up,
+ * team changes arrive by broadcast/database event in ~0.3 s and the connection
+ * watchdog still checks the session every 15 s, so the 4 s check is skipped.
+ * This cuts each iPad's requests by about 4x without slowing team changes.
+ */
 const POLL_MS = 4_000;
 /** How often queued answers are retried while any are pending. */
 const QUEUE_RETRY_MS = 8_000;
@@ -27,6 +32,9 @@ interface StoredJudge { name: string; token: string; id: string }
 
 const judgeStorageKey = (sessionId: string) => `judge_${sessionId}`;
 
+/** Judges are matched by name: stray or doubled spaces must not split one judge into two. */
+const normalizeName = (name: string) => name.trim().replace(/\s+/g, ' ');
+
 function readStoredJudge(sessionId: string): StoredJudge | null {
   try {
     const raw = localStorage.getItem(judgeStorageKey(sessionId));
@@ -34,21 +42,11 @@ function readStoredJudge(sessionId: string): StoredJudge | null {
   } catch { return null; }
 }
 
-function calculatePoints(question: Question, selectedAnswer: string): number {
-  const choices = question.choices;
-  let selectedWeight = 1;
-  let maxWeight = 1;
-  if (choices.length > 0 && typeof choices[0] === 'object') {
-    const objs = choices as { text: string; weight: number }[];
-    selectedWeight = objs.find((c) => c.text === selectedAnswer)?.weight ?? 0;
-    maxWeight = Math.max(...objs.map((c) => c.weight));
-  }
-  return Number(((selectedWeight / maxWeight) * (question.weight || 1)).toFixed(2));
-}
-
+// The server works out the points from the choice; answers queued by an older
+// build carry no choice_id and are matched by their text
 const sendPending = async (p: PendingAnswer) => {
   await upsertAnswer({
-    answer: p.answer, points: p.points, question_id: p.question_id,
+    answer: p.answer, choice_id: p.choice_id, question_id: p.question_id,
     team_id: p.team_id, judge_id: p.judge_id, session_id: p.session_id
   });
 };
@@ -65,6 +63,7 @@ export default function JudgePage() {
   const [judge, setJudge] = useState<StoredJudge | null>(null);
   const [joinError, setJoinError] = useState('');
   const [joining, setJoining] = useState(false);
+  const [joinedNames, setJoinedNames] = useState<ReadonlySet<string>>(new Set());
 
   const [currentTeam, setCurrentTeam] = useState<string | null>(null);
   const [questions, setQuestions] = useState<Question[]>([]);
@@ -118,9 +117,20 @@ export default function JudgePage() {
 
   // ----------------------------------------------------------------- join --
 
+  // Judges are matched by name, so warn when the typed name already joined this
+  // session: using it takes over that judge's record (meant for switching devices).
+  useEffect(() => {
+    if (phase !== 'join' || !sessionId) return;
+    let cancelled = false;
+    getJudgesBySession(sessionId)
+      .then((rows) => { if (!cancelled) setJoinedNames(new Set(rows.map((j) => j.name))); })
+      .catch(() => undefined); // hint only; joining still works without it
+    return () => { cancelled = true; };
+  }, [phase, sessionId]);
+
   const handleJoin = async () => {
     if (!sessionId || !session) return;
-    const name = judgeName.trim();
+    const name = normalizeName(judgeName);
     if (!name) { setJoinError('يرجى إدخال اسمك'); return; }
     setJoining(true);
     setJoinError('');
@@ -219,13 +229,17 @@ export default function JudgePage() {
       }
     ]);
 
-    if (currentTeamRef.current) void loadMyAnswers(currentTeamRef.current);
-    void flush();
+    // Send anything still waiting from before a reload FIRST, then load the saved
+    // answers, so an answer that was mid-send is never shown as unanswered
+    void flush().then(() => { if (currentTeamRef.current) void loadMyAnswers(currentTeamRef.current); });
 
-    const pollTimer = setInterval(() => { poll().catch(() => undefined); }, POLL_MS);
+    const pollTimer = setInterval(() => {
+      if (healthStore.getState().status === 'connected') return; // live connection covers it
+      poll().catch(() => undefined);
+    }, POLL_MS);
     const queueTimer = setInterval(() => { if (queue.size > 0) void flush(); }, QUEUE_RETRY_MS);
     const presenceTimer = setInterval(() => { touchJudge(judge.id).catch(() => undefined); }, PRESENCE_MS);
-    const onOnline = () => { void flush(); };
+    const onOnline = () => { queue.resetBackoff(); void flush(); };
     window.addEventListener('online', onOnline);
     window.addEventListener('focus', onOnline);
 
@@ -243,19 +257,45 @@ export default function JudgePage() {
     };
   }, [phase, sessionId, judge, applySessionState, loadMyAnswers]);
 
+  // Session ended while answers were still waiting on this iPad (it was offline
+  // when the host pressed "end", or the judge reopens the link afterwards):
+  // keep sending them until none are left.
+  useEffect(() => {
+    if (phase !== 'ended' || !sessionId) return;
+    const stored = judgeRef.current ?? readStoredJudge(sessionId);
+    if (!stored) return;
+    const queue = new OfflineAnswerQueue(`answerQueue_${sessionId}_${stored.id}`, browserStorage());
+    if (queue.size === 0) return;
+    setPendingCount(queue.size);
+    const unsub = queue.subscribe(() => setPendingCount(queue.size));
+    const drain = () => { if (queue.size > 0) void queue.flush(sendPending).catch(() => undefined); };
+    const onOnline = () => { queue.resetBackoff(); drain(); };
+    drain();
+    const timer = setInterval(drain, QUEUE_RETRY_MS);
+    window.addEventListener('online', onOnline);
+    window.addEventListener('focus', onOnline);
+    return () => {
+      clearInterval(timer);
+      unsub();
+      window.removeEventListener('online', onOnline);
+      window.removeEventListener('focus', onOnline);
+    };
+  }, [phase, sessionId]);
+
   const allAnswered = questions.length > 0 && questions.every((q) => selectedAnswers[q.id]);
+  const currentTrack = currentTeam ? session?.teamTracks?.[currentTeam] ?? null : null;
 
   // -------------------------------------------------------------- actions --
 
-  const handleAnswerSelect = (question: Question, answer: string) => {
+  const handleAnswerSelect = (question: Question, choice: QuestionChoice) => {
     const team = currentTeamRef.current;
     if (!team || !judge || !sessionId) return;
-    if (selectedAnswers[question.id] === answer) return;
-    setSelectedAnswers((prev) => ({ ...prev, [question.id]: answer }));
+    if (selectedAnswers[question.id] === choice.text) return;
+    setSelectedAnswers((prev) => ({ ...prev, [question.id]: choice.text }));
     setSubmitted(false);
     queueRef.current?.enqueue({
       session_id: sessionId, team_id: team, judge_id: judge.id,
-      question_id: question.id, answer, points: calculatePoints(question, answer)
+      question_id: question.id, choice_id: choice.id, answer: choice.text
     });
     void queueRef.current?.flush(sendPending).catch(() => undefined);
   };
@@ -295,7 +335,9 @@ export default function JudgePage() {
             {ended ? <CheckCircle2 /> : <Link2Off />}
             <h3>{ended ? 'انتهت جلسة التحكيم' : 'رابط الجلسة غير صالح'}</h3>
             <p>
-              {ended
+              {ended && pendingCount > 0
+                ? `جاري إرسال ${pendingCount} إجابة متبقية من هذا الجهاز. أبقِ الصفحة مفتوحة حتى يكتمل الإرسال.`
+                : ended
                 ? 'شكراً لمشاركتك. تم حفظ جميع إجاباتك.'
                 : 'الانضمام للتحكيم يتم فقط عبر الرابط الخاص الذي يرسله المضيف لكل جلسة.'}
             </p>
@@ -333,14 +375,21 @@ export default function JudgePage() {
               id="judgeName"
               type="text"
               value={judgeName}
-              onChange={(e) => setJudgeName(e.target.value)}
+              onChange={(e) => { setJudgeName(e.target.value); setJoinError(''); }}
               onKeyDown={(e) => e.key === 'Enter' && handleJoin()}
-              placeholder="أدخل اسمك"
-              autoComplete="name"
+              placeholder="أدخل اسمك الكامل"
+              autoComplete="off"
               maxLength={60}
               style={{ padding: '12px 14px', fontSize: '16px' }}
             />
           </div>
+
+          {joinedNames.has(normalizeName(judgeName)) && (
+            <div className="alert alert-warning" role="status">
+              <AlertCircle />
+              <span>هذا الاسم انضم مسبقاً لهذه الجلسة. تابع فقط إذا كان اسمك وتريد المتابعة من هذا الجهاز، وإلا أضف اسم العائلة لتمييزه.</span>
+            </div>
+          )}
 
           <button className="btn btn-primary btn-lg btn-block" onClick={handleJoin} disabled={joining}>
             {joining ? <RefreshCw className="spin" /> : <LogIn />}
@@ -388,6 +437,7 @@ export default function JudgePage() {
           <div className="judge-team-banner">
             <h2>يتم تحكيم</h2>
             <div className="team-name">{currentTeam ?? 'بانتظار المضيف'}</div>
+            {currentTrack && <div className="judge-team-banner__track">المسار: <b>{currentTrack}</b></div>}
           </div>
 
           {!online && (
@@ -426,21 +476,16 @@ export default function JudgePage() {
                   <span className="question-block__num">السؤال {index + 1}</span>
                   <div className="question-block__text">{question.text}</div>
                   <div className="choice-grid">
-                    {question.choices.map((choice, choiceIdx) => {
-                      const choiceText = typeof choice === 'string' ? choice : choice.text;
-                      const choiceWeight = typeof choice === 'string' ? 1 : choice.weight;
-                      const isSelected = selectedAnswers[question.id] === choiceText;
+                    {question.choices.map((choice) => {
+                      const isSelected = selectedAnswers[question.id] === choice.text;
                       return (
                         <button
-                          key={choiceIdx}
+                          key={choice.id}
                           className={`answer-btn ${isSelected ? 'selected' : ''}`}
-                          onClick={() => handleAnswerSelect(question, choiceText)}
+                          onClick={() => handleAnswerSelect(question, choice)}
                           aria-pressed={isSelected}
                         >
-                          <div>{choiceText}</div>
-                          {typeof choice !== 'string' && (
-                            <div className="answer-btn__weight">وزن: {choiceWeight}</div>
-                          )}
+                          <div>{choice.text}</div>
                           {isSelected && <span className="answer-btn__check"><Check /></span>}
                         </button>
                       );

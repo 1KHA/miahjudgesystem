@@ -42,8 +42,13 @@ const CFG = {
   judges: Number(arg('judges', SMOKE ? 8 : 50)),
   teams: Number(arg('teams', SMOKE ? 6 : 200)),
   questionsPerTeam: Number(arg('questions', 5)),
+  tracks: Number(arg('tracks', 4)),
   hours: Number(arg('hours', SMOKE ? 0.12 : 12)),
-  breaks: SMOKE ? [[0.34, 0.6], [0.67, 1.0]] : [[0.34, 30], [0.67, 50]],
+  // --breaks "30,50" = minutes of each break, placed at 1/3 and 2/3 of the teams
+  breaks: (() => {
+    const mins = String(arg('breaks', SMOKE ? '0.6,1' : '30,50')).split(',').map(Number).filter((n) => n > 0);
+    return mins.map((m, i) => [(i + 1) / (mins.length + 1) + 0.005, m]);
+  })(),
   sleepFraction: 0.4,        // judges that fully disconnect during a break
   offlineFraction: 0.12,     // judges that lose network for part of a round
   offlineMs: SMOKE ? [3000, 8000] : [15000, 60000],
@@ -86,10 +91,21 @@ const pct = (arr, p) => arr.length ? Math.round([...arr].sort((a, b) => a - b)[M
 const cap = (arr, n = 50000) => { if (arr.length > n) arr.splice(0, n / 2); };
 const log = (...a) => console.log(`[${((Date.now() - M.startedAt) / 60000).toFixed(1).padStart(6)}m]`, ...a);
 
-function makeClient() {
+const REQ = { judge: 0, host: 0, judgeBytes: 0 };
+function makeClient(who = 'host') {
+  const countingFetch = async (input, init) => {
+    REQ[who]++;
+    const res = await fetch(input, init);
+    if (who === 'judge') {
+      const len = Number(res.headers.get('content-length') || 0);
+      REQ.judgeBytes += len + 600; // + typical request/response header overhead
+    }
+    return res;
+  };
   return createClient(SUPABASE_URL, ANON_KEY, {
     realtime: { params: { eventsPerSecond: 10 } },
     auth: { persistSession: false, autoRefreshToken: false },
+    global: { fetch: countingFetch },
   });
 }
 
@@ -233,7 +249,7 @@ class Host {
 class Judge {
   constructor(n) {
     this.n = n; this.name = `${TAG}-judge-${String(n).padStart(2, '0')}`;
-    this.sb = makeClient(); this.id = null; this.token = crypto.randomUUID();
+    this.sb = makeClient('judge'); this.id = null; this.token = crypto.randomUUID();
     this.team = null; this.questions = []; this.queue = []; this.offline = false; this.busy = false;
     this.connected = false; this.seen = new Map(); // team -> {at, path}
     this.roundSent = null; this.answered = new Map(); // team -> Set(questionId)
@@ -267,7 +283,11 @@ class Judge {
       { name: `session-row-${SESSION_ID}`, configure: (c) => c.on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'sessions', filter: `session_id=eq.${SESSION_ID}` }, (p) => { this.ch.heard(); this.apply(p.new.current_team_id, p.new.status, 'dbEvent'); }) },
     ], poll, () => { poll().catch(() => {}); this.flush(); });
     this.ch.start();
-    this.pollTimer = setInterval(() => poll().catch(() => {}), 4000);
+    this.pollTimer = setInterval(() => {
+      const live = [...this.ch.channels.values()].every((c) => c.state === 'joined') && this.sb.realtime.isConnected();
+      if (live) return; // JudgePage: live connection covers it, watchdog checks every 15 s
+      poll().catch(() => {});
+    }, 4000);
     this.queueTimer = setInterval(() => this.flush(), 8000);
     this.presenceTimer = setInterval(() => this.sb.from('judges').update({ last_seen_at: new Date().toISOString() }).eq('id', this.id).then(() => {}), 60000);
     this.connected = true;
@@ -297,12 +317,6 @@ class Judge {
       if (this.roundSent) M.deliveryLatency[path].push(now - this.roundSent);
     }
     this.answerAll().catch((e) => recordError('judge:answerAll', e));
-  }
-  points(q, text) {
-    const w = (c) => (typeof c === 'string' ? 1 : c.weight);
-    const max = Math.max(1, ...q.choices.map(w));
-    const chosen = q.choices.find((c) => (typeof c === 'string' ? c : c.text) === text);
-    return Number(((chosen ? w(chosen) : 0) / max * (q.weight || 1)).toFixed(2));
   }
   /** Cut the websocket without telling the client (like a NAT/wifi drop). The watchdog must notice. */
   async killSocket() {
@@ -337,7 +351,9 @@ class Judge {
     this.answered.get(team).add(q.id);
     const key = `${team}|${q.id}`;
     this.queue = this.queue.filter((i) => i.key !== key);
-    this.queue.push({ key, session_id: SESSION_ID, team_id: team, judge_id: this.id, question_id: q.id, answer: text, points: this.points(q, text), attempts: 0 });
+    // like JudgePage: send the chosen choice; the server works out the points
+    const choice = q.choices.find((c) => c.text === text);
+    this.queue.push({ key, session_id: SESSION_ID, team_id: team, judge_id: this.id, question_id: q.id, choice_id: choice.id, answer: text, attempts: 0 });
     this.saveQueue();
   }
   async flush() {
@@ -347,7 +363,7 @@ class Judge {
       while (this.queue.length) {
         const it = this.queue[0];
         const t0 = Date.now();
-        const row = { session_id: it.session_id, team_id: it.team_id, judge_id: it.judge_id, question_id: it.question_id, answer: it.answer, points: it.points, updated_at: new Date().toISOString() };
+        const row = { session_id: it.session_id, team_id: it.team_id, judge_id: it.judge_id, question_id: it.question_id, choice_id: it.choice_id, answer: it.answer, updated_at: new Date().toISOString() };
         const { error } = await this.sb.from('answers').upsert(row, { onConflict: 'session_id,team_id,judge_id,question_id' }).select('id').single();
         if (error) { it.attempts++; M.answersFailed++; recordError('judge:upsertAnswer', error); break; }
         M.answerLatency.push(Date.now() - t0); cap(M.answerLatency);
@@ -395,21 +411,27 @@ class Judge {
 
 async function setup(admin) {
   log(`Creating question bank + ${CFG.questionsPerTeam} questions...`);
-  const { data: bank, error: be } = await admin.from('question_banks').insert({ name: `${TAG} load test bank` }).select().single();
+  // saved like the app does: bank + questions + choices in one transaction
+  const { data: bankId, error: be } = await admin.rpc('create_question_bank', {
+    p_name: `${TAG} load test bank`,
+    p_questions: Array.from({ length: CFG.questionsPerTeam }, (_, i) => ({
+      text: `${TAG} سؤال التحكيم رقم ${i + 1}`, section: `${TAG} عام`, weight: 1,
+      choices: [{ text: 'ممتاز', weight: 5 }, { text: 'جيد جدا', weight: 4 }, { text: 'جيد', weight: 3 }, { text: 'مقبول', weight: 2 }, { text: 'ضعيف', weight: 1 }],
+    })),
+  });
   if (be) throw be;
-  const { data: questions, error: qe } = await admin.from('questions').insert(Array.from({ length: CFG.questionsPerTeam }, (_, i) => ({
-    text: `${TAG} سؤال التحكيم رقم ${i + 1}`,
-    choices: [{ text: 'ممتاز', weight: 5 }, { text: 'جيد جدا', weight: 4 }, { text: 'جيد', weight: 3 }, { text: 'مقبول', weight: 2 }, { text: 'ضعيف', weight: 1 }],
-    section: `${TAG} عام`, weight: 1, bank_id: bank.id,
-  }))).select();
+  const { data: qrows, error: qe } = await admin.from('questions').select('id, text, section, weight, question_choices(id, text, weight, position)').eq('bank_id', bankId).order('text');
   if (qe) throw qe;
+  const questions = qrows.map(({ question_choices, ...q }) => ({ ...q, choices: question_choices.sort((a, b) => a.position - b.position) }));
   const teams = Array.from({ length: CFG.teams }, (_, i) => `${TAG}-team-${String(i + 1).padStart(3, '0')}`);
   const { error: se } = await admin.from('sessions').insert({
     name: `${TAG} load test session`, session_id: SESSION_ID, host_token: crypto.randomUUID(), host_id: null,
     status: 'active', current_team_index: 0, current_team_id: null, total_points: 100,
   });
   if (se) throw se;
-  const { error: te } = await admin.from('session_teams').insert(teams.map((name, position) => ({ session_id: SESSION_ID, name, position })));
+  const perTrack = Math.ceil(CFG.teams / CFG.tracks);
+  const trackOf = (i) => `${TAG}-مسار-${Math.floor(i / perTrack) + 1}`;
+  const { error: te } = await admin.from('session_teams').insert(teams.map((name, position) => ({ session_id: SESSION_ID, name, position, track: trackOf(position) })));
   if (te) throw te;
   const { error: sqe } = await admin.from('session_questions').insert(questions.map((q, position) => ({ session_id: SESSION_ID, question_id: q.id, position })));
   if (sqe) throw sqe;
@@ -431,14 +453,25 @@ async function integrityCheck(expected) {
     add('no duplicate answers', rows === distinct, `${rows} rows, ${distinct} distinct keys`);
     add('every judge answered every question for every team', rows === expected, `${rows} rows, expected ${expected}`);
     const lb = await q('select * from session_leaderboard($1)', [SESSION_ID]);
-    const direct = await q('select team_id, sum(points)::numeric(10,2) s from answers where session_id=$1 group by 1', [SESSION_ID]);
+    // team score = per question, the average of the judges who answered it, summed
+    const direct = await q(`select team_id, round(sum(avg_points), 2) s from (
+      select team_id, question_id, avg(points) avg_points from answers where session_id=$1 group by 1, 2) x group by 1`, [SESSION_ID]);
     const dm = new Map(direct.map((r) => [r.team_id, Number(r.s)]));
     const mismatch = lb.filter((r) => Math.abs(Number(r.total_points) - (dm.get(r.team_id) || 0)) > 0.005);
-    add('leaderboard equals direct SQL sum for every team', mismatch.length === 0, `${lb.length} teams, ${mismatch.length} mismatches`);
+    add('leaderboard equals the judges-average computed directly for every team', mismatch.length === 0, `${lb.length} teams, ${mismatch.length} mismatches`);
+    const [{ team_max, judge_max }] = await q(`select (select max(total_points) from session_leaderboard($1))::float8 team_max,
+      (select max(s) from (select sum(points) s from answers where session_id=$1 group by team_id, judge_id) x)::float8 judge_max`, [SESSION_ID]);
+    add('scores are out of 100 (team and single judge)', team_max <= 100 && judge_max <= 100.0001, `best team ${team_max}, best single-judge total ${judge_max?.toFixed(4)}`);
     const [{ n: results }] = await q('select count(*)::int n from session_results where session_id=$1', [SESSION_ID]);
     add('session_results has one row per team', results === CFG.teams, `${results}/${CFG.teams}`);
     const [{ status }] = await q('select status from sessions where session_id=$1', [SESSION_ID]);
     add('session marked completed', status === 'completed', status);
+    const rk = await q(`select r.team_id from session_results r join session_leaderboard($1) l using (team_id)
+                         where r.track is distinct from l.track or r.overall_rank <> l.overall_rank or r.track_rank <> l.track_rank`, [SESSION_ID]);
+    add('saved results carry the same track and ranks as the live ranking', rk.length === 0, `${rk.length} differences`);
+    const tr = await q(`select track, count(*)::int n, count(*) filter (where track_rank <= 3)::int top from session_results where session_id=$1 group by 1 order by 1`, [SESSION_ID]);
+    const expectedTracks = Math.ceil(CFG.teams / Math.ceil(CFG.teams / CFG.tracks));
+    add('every track has a top 3', tr.length === expectedTracks && tr.every((t) => t.top >= Math.min(3, t.n)), tr.map((t) => `${t.track.split('-').pop()}:${t.n} teams, ${t.top} in top 3`).join(' | '));
     const [{ n: judges }] = await q('select count(*)::int n from judges where session_id=$1', [SESSION_ID]);
     add('one judge row per judge', judges === CFG.judges, `${judges}/${CFG.judges}`);
     await c.end();
@@ -464,6 +497,14 @@ function snapshot(state) {
     },
     host: { answerEvents: M.hostAnswerEvents, refreshes: M.hostRefreshes, progressRpcMs: lat(M.rpcLatency.progress), leaderboardRpcMs: lat(M.rpcLatency.leaderboard) },
     pollStats: { ...M.pollStats, avgMs: (M.pollStats.ok + M.pollStats.fail) ? Math.round(M.pollStats.totalMs / (M.pollStats.ok + M.pollStats.fail)) : null },
+    requests: (() => {
+      const min = (Date.now() - M.startedAt) / 60000;
+      return {
+        judgeTotal: REQ.judge, hostTotal: REQ.host,
+        perJudgePerMinute: +(REQ.judge / CFG.judges / min).toFixed(1),
+        approxMBPerJudgePerHour: +((REQ.judgeBytes / CFG.judges / min) * 60 / 1e6).toFixed(2),
+      };
+    })(),
     reconnects: { total: M.reconnects.length, host: M.reconnects.filter((r) => r.who === 'host').length, judgesAfterBreak: M.reconnects.filter((r) => r.reason === 'rejoin-after-break').length },
     channelErrors: M.channelEvents.filter((c) => ['CHANNEL_ERROR', 'TIMED_OUT'].includes(c.status)).length,
     scenarios: {

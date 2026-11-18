@@ -3,7 +3,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   ArrowRight, Users, Send, Scale, FileText, Trophy, Plus, BarChart3, HeartPulse,
   Wifi, WifiOff, RefreshCw, ChevronLeft, ChevronRight, Square, CheckCircle2, Clock, UserRound,
-  Copy, Check, Link2
+  Copy, Check, Link2, Play
 } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../hooks/useAuth';
@@ -15,6 +15,8 @@ import {
   getJudgesBySession, getTeamProgress, getTeamAnswers, getLeaderboard
 } from '../lib/supabaseService';
 import BrandHeader from '../components/BrandHeader';
+import TrackPodium from '../components/TrackPodium';
+import { trackOrder } from '../lib/teamImport';
 import LoadingScreen from '../components/LoadingScreen';
 import type { SessionDetail, Judge, JudgeProgress, TeamAnswerRow, LeaderboardEntry } from '../types';
 
@@ -39,6 +41,8 @@ export default function ControlPage() {
   const [session, setSession] = useState<SessionDetail | null>(null);
   const [authorized, setAuthorized] = useState<boolean | null>(null);
   const [currentTeamIndex, setCurrentTeamIndex] = useState(0);
+  /** false until the host starts judging: judges wait and no team is current */
+  const [started, setStarted] = useState(false);
   const [judges, setJudges] = useState<Judge[]>([]);
   const [progress, setProgress] = useState<JudgeProgress>({});
   const [teamAnswers, setTeamAnswers] = useState<TeamAnswerRow[]>([]);
@@ -54,7 +58,11 @@ export default function ControlPage() {
 
   const teams = session?.teams ?? [];
   const questions = session?.questions ?? [];
-  const currentTeam = teams[currentTeamIndex] ?? null;
+  const currentTeam = started ? teams[currentTeamIndex] ?? null : null;
+  const teamTracks = session?.teamTracks ?? {};
+  const currentTrack = currentTeam ? teamTracks[currentTeam] ?? null : null;
+  const tracksInOrder = trackOrder(teams.map((t) => ({ track: teamTracks[t] })));
+  const hasTracks = tracksInOrder.some(Boolean);
   teamRef.current = currentTeam;
 
   // ---------------------------------------------------------------- loaders --
@@ -113,6 +121,7 @@ export default function ControlPage() {
         setSession(data);
         const idx = data.current_team_id ? Math.max(0, data.teams.indexOf(data.current_team_id)) : 0;
         setCurrentTeamIndex(idx);
+        setStarted(Boolean(data.current_team_id));
         setAuthorized(true);
       } catch (e) {
         console.error('Error loading session:', e);
@@ -151,7 +160,17 @@ export default function ControlPage() {
         name: `judges-${sessionId}`,
         configure: (ch) => ch.on('postgres_changes',
           { event: '*', schema: 'public', table: 'judges', filter: `session_id=eq.${sessionId}` },
-          () => { healthStore.noteChannelEvent(`judges-${sessionId}`); void loadJudges(); })
+          (payload) => {
+            healthStore.noteChannelEvent(`judges-${sessionId}`);
+            // Presence pings (every judge, every minute) are UPDATEs: patch the row
+            // locally instead of refetching the whole judge list each time
+            if (payload.eventType === 'UPDATE') {
+              const row = payload.new as Judge;
+              setJudges((prev) => prev.map((j) => (j.id === row.id ? { ...j, ...row } : j)));
+            } else {
+              void loadJudges();
+            }
+          })
       },
       {
         name: `answers-${sessionId}`,
@@ -195,6 +214,7 @@ export default function ControlPage() {
       // 1. Persist: judges' database channel and poll both pick this up
       await saveCurrentTeam(sessionId, index, team);
       setCurrentTeamIndex(index);
+      setStarted(true);
       // 2. Broadcast: instant path for connected judges
       await announceTeam(team);
     } catch (e) {
@@ -205,18 +225,44 @@ export default function ControlPage() {
     }
   };
 
-  const handlePreviousTeam = () => goToTeam(currentTeamIndex > 0 ? currentTeamIndex - 1 : teams.length - 1);
-  const handleNextTeam = () => goToTeam(currentTeamIndex < teams.length - 1 ? currentTeamIndex + 1 : 0);
+  /** Judges who have not answered every question for the team on screen. */
+  const unfinishedJudges = () => {
+    const total = questions.length;
+    if (!total || !currentTeam) return [];  // nothing to finish before judging starts
+    return judges.filter((j) => (progress[j.id]?.answered ?? 0) < total);
+  };
+
+  /** Ask before leaving a team that some judges have not finished: they will never see it again. */
+  const confirmLeaveTeam = (action: string) => {
+    const left = unfinishedJudges();
+    if (left.length === 0) return true;
+    const names = left.slice(0, 6).map((j) => j.name).join('، ');
+    return confirm(
+      `لم يكمل ${left.length} من ${judges.length} محكمين تقييم "${currentTeam}"` +
+      `${names ? `:\n${names}${left.length > 6 ? '…' : ''}` : ''}\n\n` +
+      `بعد ${action} لن يظهر هذا الفريق لهم مرة أخرى. هل تريد المتابعة؟`
+    );
+  };
+
+  const handlePreviousTeam = () => {
+    if (!confirmLeaveTeam('الانتقال')) return;
+    goToTeam(currentTeamIndex > 0 ? currentTeamIndex - 1 : teams.length - 1);
+  };
+  const handleNextTeam = () => {
+    if (!confirmLeaveTeam('الانتقال')) return;
+    goToTeam(currentTeamIndex < teams.length - 1 ? currentTeamIndex + 1 : 0);
+  };
   const handleResend = () => currentTeam && announceTeam(currentTeam);
 
   const handleEndSession = async () => {
-    if (!confirm('هل أنت متأكد من إنهاء الجلسة؟ سيتم حفظ النتائج النهائية.')) return;
+    if (!confirmLeaveTeam('إنهاء الجلسة')) return;
+    if (!confirm('هل أنت متأكد من إنهاء الجلسة؟ سيتم حفظ النتائج النهائية وإعلان الأوائل.')) return;
     setEnding(true);
     try {
       const n = await finishSession(sessionId);
       await announceTeam(currentTeam ?? '', 'completed');
       alert(`تم إنهاء الجلسة وحفظ نتائج ${n} فريق بنجاح`);
-      navigate('/host', { replace: true });
+      navigate(`/results?session=${encodeURIComponent(sessionId)}`, { replace: true });
     } catch (e) {
       console.error('Error ending session:', e);
       alert('خطأ في إنهاء الجلسة: ' + (e as Error).message);
@@ -296,7 +342,7 @@ export default function ControlPage() {
             <div className="card-header">
               <div className="card-title">
                 <div className="card-icon"><Users /></div>
-                <span>الفريق الحالي ({teams.length ? currentTeamIndex + 1 : 0}/{teams.length})</span>
+                <span>الفريق الحالي ({started && teams.length ? currentTeamIndex + 1 : 0}/{teams.length})</span>
               </div>
               {lastBroadcastOk === false && (
                 <span className="badge badge-warning" title="الرسالة الفورية لم تصل، المحكمون سيحصلون على الفريق خلال ثوانٍ عبر المزامنة">
@@ -305,31 +351,57 @@ export default function ControlPage() {
                 </span>
               )}
             </div>
-            <div className="team-display">
-              <div className="team-display__label">يتم تحكيم</div>
-              <div className="team-name">{currentTeam ?? 'لا يوجد'}</div>
-            </div>
-            <p className="card-desc">
-              {totalQuestions} سؤال لكل فريق. عند الانتقال لفريق يصل للمحكمين فوراً، ومن ينقطع اتصاله يتزامن تلقائياً.
-            </p>
-            <div className="btn-group">
-              <button className="btn btn-secondary" onClick={handlePreviousTeam} disabled={switching}>
-                <ChevronRight />
-                السابق
-              </button>
-              <button className="btn btn-primary" onClick={handleNextTeam} disabled={switching}>
-                التالي
-                <ChevronLeft />
-              </button>
-              <button className="btn btn-outline" onClick={handleResend} disabled={!currentTeam} title="إعادة إرسال الفريق الحالي للمحكمين">
-                <Send />
-                إعادة إرسال
-              </button>
-              <button className="btn btn-danger" onClick={handleEndSession} disabled={ending}>
-                <Square />
-                {ending ? 'جاري الإنهاء...' : 'إنهاء'}
-              </button>
-            </div>
+            {!started ? (
+              <>
+                <div className="team-display">
+                  <div className="team-display__label">لم يبدأ التحكيم بعد</div>
+                  <div className="team-name">{judges.length} محكم في الانتظار</div>
+                  {teams[0] && <div className="team-display__track">أول فريق: <b>{teams[0]}</b></div>}
+                </div>
+                <p className="card-desc">
+                  المحكمون الذين انضموا يرون شاشة الانتظار. عند الضغط على بدء يصلهم الفريق الأول فوراً.
+                </p>
+                <div className="btn-group">
+                  <button className="btn btn-primary btn-lg" onClick={() => goToTeam(0)} disabled={switching || teams.length === 0}>
+                    <Play />
+                    {switching ? 'جاري البدء...' : 'بدء التحكيم'}
+                  </button>
+                  <button className="btn btn-danger" onClick={handleEndSession} disabled={ending}>
+                    <Square />
+                    {ending ? 'جاري الإنهاء...' : 'إنهاء'}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="team-display">
+                  <div className="team-display__label">يتم تحكيم</div>
+                  <div className="team-name">{currentTeam ?? 'لا يوجد'}</div>
+                  {currentTrack && <div className="team-display__track">المسار: <b>{currentTrack}</b></div>}
+                </div>
+                <p className="card-desc">
+                  {totalQuestions} سؤال لكل فريق. عند الانتقال لفريق يصل للمحكمين فوراً، ومن ينقطع اتصاله يتزامن تلقائياً.
+                </p>
+                <div className="btn-group">
+                  <button className="btn btn-secondary" onClick={handlePreviousTeam} disabled={switching}>
+                    <ChevronRight />
+                    السابق
+                  </button>
+                  <button className="btn btn-primary" onClick={handleNextTeam} disabled={switching}>
+                    التالي
+                    <ChevronLeft />
+                  </button>
+                  <button className="btn btn-outline" onClick={handleResend} disabled={!currentTeam} title="إعادة إرسال الفريق الحالي للمحكمين">
+                    <Send />
+                    إعادة إرسال
+                  </button>
+                  <button className="btn btn-danger" onClick={handleEndSession} disabled={ending}>
+                    <Square />
+                    {ending ? 'جاري الإنهاء...' : 'إنهاء'}
+                  </button>
+                </div>
+              </>
+            )}
           </div>
 
           {/* Judges */}
@@ -422,6 +494,18 @@ export default function ControlPage() {
             </div>
           </div>
 
+          {/* Top 3 overall and per track */}
+          <div className="card span-2">
+            <div className="card-header">
+              <div className="card-title">
+                <div className="card-icon"><Trophy /></div>
+                <span>{hasTracks ? 'الأوائل حسب المسار' : 'الأوائل'}</span>
+              </div>
+              <span className="text-xs text-secondary">يتحدث تلقائياً مع كل تقييم</span>
+            </div>
+            <TrackPodium leaderboard={leaderboard} trackOrder={tracksInOrder} currentTeam={currentTeam} />
+          </div>
+
           {/* Leaderboard */}
           <div className="card span-2">
             <div className="card-header">
@@ -437,19 +521,23 @@ export default function ControlPage() {
                   <tr>
                     <th style={{ width: '56px' }}>#</th>
                     <th>الفريق</th>
+                    {hasTracks && <th>المسار</th>}
+                    {hasTracks && <th className="num">ترتيبه في المسار</th>}
                     <th className="num">الإجابات</th>
                     <th className="num">المحكمون</th>
-                    <th className="num">إجمالي النقاط</th>
+                    <th className="num">الدرجة من 100</th>
                   </tr>
                 </thead>
                 <tbody>
                   {leaderboard.length === 0 ? (
-                    <tr><td colSpan={5} className="empty-state">لا توجد نتائج بعد</td></tr>
+                    <tr><td colSpan={hasTracks ? 7 : 5} className="empty-state">لا توجد نتائج بعد</td></tr>
                   ) : (
-                    leaderboard.map((entry, idx) => (
+                    leaderboard.map((entry) => (
                       <tr key={entry.teamName} style={entry.teamName === currentTeam ? { background: 'var(--primary-tint)' } : undefined}>
-                        <td><span className={`rank-badge rank-badge--${idx + 1}`}>{idx + 1}</span></td>
+                        <td><span className={`rank-badge rank-badge--${entry.overallRank}`}>{entry.overallRank}</span></td>
                         <td className="fw-600">{entry.teamName}</td>
+                        {hasTracks && <td>{entry.track ? <span className="track-badge track-badge--sm">{entry.track}</span> : '—'}</td>}
+                        {hasTracks && <td className="num text-secondary">{entry.trackRank}</td>}
                         <td className="num text-secondary">{entry.answerCount}</td>
                         <td className="num text-secondary">{entry.judgeCount}</td>
                         <td className="num fw-700 text-primary">{entry.totalPoints.toFixed(2)}</td>

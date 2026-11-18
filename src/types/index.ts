@@ -1,8 +1,15 @@
 export interface Team {
   id: string;
   name: string;
+  track?: string | null;
   display_order?: number;
   created_at?: string;
+}
+
+/** A team as it is placed into a session (name + track snapshot). */
+export interface SessionTeam {
+  name: string;
+  track: string | null;
 }
 
 export interface QuestionBank {
@@ -12,19 +19,26 @@ export interface QuestionBank {
   questions?: Question[];
 }
 
+/** One answer button of a question (row in `question_choices`). */
 export interface QuestionChoice {
+  id: string;
   text: string;
   weight: number;
+  position: number;
 }
 
 export interface Question {
   id: string;
   text: string;
-  choices: string[] | QuestionChoice[]; // Support both formats for backward compatibility
+  /** Ordered by position. */
+  choices: QuestionChoice[];
   section: string;
+  /** Section weight: the section's share of the session total. */
   weight: number;
   bank_id?: string;
   created_at?: string;
+  /** Points this question is worth in a session (set when loaded for a session). */
+  maxPoints?: number;
 }
 
 export interface Judge {
@@ -56,6 +70,8 @@ export interface Session {
 /** Session plus its ordered teams and questions (joined from session_teams / session_questions). */
 export interface SessionDetail extends Session {
   teams: string[];
+  /** team name -> track (null when the team has no track) */
+  teamTracks: Record<string, string | null>;
   questions: Question[];
 }
 
@@ -67,6 +83,8 @@ export interface SessionSummary extends Session {
 export interface Answer {
   id: string;
   answer: string;
+  choice_id?: string | null;
+  /** Set by the server from the chosen choice (answers_set_points). */
   points?: number;
   question_id: string;
   team_id: string;
@@ -80,9 +98,12 @@ export interface SessionResult {
   id: string;
   session_id: string;
   team_id: string;
+  track?: string | null;
   total_points: number;
   answer_count: number;
   judge_count: number;
+  overall_rank?: number | null;
+  track_rank?: number | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -90,9 +111,14 @@ export interface SessionResult {
 /** One row of the server-side `session_leaderboard()` aggregate. */
 export interface LeaderboardEntry {
   teamName: string;
+  track: string | null;
   totalPoints: number;
   answerCount: number;
   judgeCount: number;
+  /** 1-based place among all teams; tied teams share a place */
+  overallRank: number;
+  /** 1-based place within the team's track; tied teams share a place */
+  trackRank: number;
 }
 
 /** Per-judge progress for the team currently being judged. */
@@ -119,8 +145,10 @@ export interface PendingAnswer {
   team_id: string;
   judge_id: string;
   question_id: string;
+  choice_id?: string;
   answer: string;
-  points: number;
+  /** Only in answers queued by builds before v4; the server ignores it. */
+  points?: number;
   queuedAt: number;
   attempts: number;
 }

@@ -6,15 +6,23 @@ import {
   getTeams,
   getQuestionBanks,
   getQuestions,
+  createQuestionBank,
   createSession,
+  startSession,
   getJudgesBySession
 } from '../lib/supabaseService';
 import { RealtimeManager } from '../lib/realtimeManager';
 import { healthStore } from '../lib/connectionHealth';
-import type { Team, Question, QuestionBank, Judge } from '../types';
+import { trackOrder } from '../lib/teamImport';
+import { SESSION_TOTAL_POINTS, questionMaxPoints, sectionPoints } from '../lib/scoring';
+import TeamUploadPanel from '../components/TeamUploadPanel';
+import QuestionBankEditor from '../components/QuestionBankEditor';
+import { newSection, draftProblems, draftToBankQuestions, orderBySection, type DraftSection } from '../lib/questionBank';
+import QuestionList from '../components/QuestionList';
+import type { Team, Question, QuestionBank, Judge, SessionTeam } from '../types';
 import {
   ArrowRight, ArrowUp, ArrowDown, Users, HelpCircle, Scale, Check, CheckCheck, X,
-  Plus, Minus, Pencil, Trash2, Save, Loader2, Link2, Copy, Clock, Play, UserRound,
+  Plus, Pencil, Trash2, Save, Loader2, Link2, Copy, Clock, Play, UserRound,
   AlertTriangle, ChevronLeft
 } from 'lucide-react';
 import BrandHeader from '../components/BrandHeader';
@@ -34,8 +42,10 @@ export default function SetupPage() {
   const [teams, setTeams] = useState<Team[]>([]);
   const [selectedTeams, setSelectedTeams] = useState<string[]>([]);
   const [newTeamName, setNewTeamName] = useState<string>('');
+  const [newTeamTrack, setNewTeamTrack] = useState<string>('');
   const [editingTeamId, setEditingTeamId] = useState<string | null>(null);
   const [editingTeamName, setEditingTeamName] = useState<string>('');
+  const [editingTeamTrack, setEditingTeamTrack] = useState<string>('');
 
   // Step 2 — questions
   const [questionBanks, setQuestionBanks] = useState<QuestionBank[]>([]);
@@ -47,15 +57,14 @@ export default function SetupPage() {
   // Step 2 — optional inline "create a new bank" form
   const [showBankForm, setShowBankForm] = useState(false);
   const [newBankName, setNewBankName] = useState('');
-  const [newBankQuestions, setNewBankQuestions] = useState<
-    { text: string; choices: { text: string; weight: number }[] }[]
-  >([{ text: '', choices: [{ text: '', weight: 1 }, { text: '', weight: 1 }] }]);
+  const [newBankSections, setNewBankSections] = useState<DraftSection[]>(() => [newSection(0)]);
   const [savingBank, setSavingBank] = useState(false);
 
   // Step 3 — session + judges
   const [sessionId, setSessionId] = useState<string>('');
   const [judges, setJudges] = useState<Judge[]>([]);
   const [creating, setCreating] = useState(false);
+  const [starting, setStarting] = useState(false);
   const [copied, setCopied] = useState(false);
 
   const step1Done = selectedTeams.length > 0;
@@ -81,7 +90,16 @@ export default function SetupPage() {
       name: `judges-${sessionId}`,
       configure: (ch) => ch.on('postgres_changes',
         { event: '*', schema: 'public', table: 'judges', filter: `session_id=eq.${sessionId}` },
-        () => { healthStore.noteChannelEvent(`judges-${sessionId}`); loadJudges(sessionId); })
+        (payload) => {
+          healthStore.noteChannelEvent(`judges-${sessionId}`);
+          // Presence pings are UPDATEs: patch locally instead of refetching the whole list
+          if (payload.eventType === 'UPDATE') {
+            const row = payload.new as Judge;
+            setJudges((prev) => prev.map((j) => (j.id === row.id ? { ...j, ...row } : j)));
+          } else {
+            loadJudges(sessionId);
+          }
+        })
     }]);
     const poll = setInterval(() => loadJudges(sessionId), 5000);
 
@@ -116,16 +134,18 @@ export default function SetupPage() {
   // ---- Step 1: team management ----
 
   const handleAddTeam = async () => {
-    if (!newTeamName.trim()) {
+    const name = newTeamName.replace(/\s+/g, ' ').trim();
+    if (!name) {
       alert('يرجى إدخال اسم الفريق');
       return;
     }
-    if (teams.some(t => t.name === newTeamName.trim())) {
+    if (teams.some(t => t.name.toLowerCase() === name.toLowerCase())) {
       alert('اسم الفريق موجود بالفعل');
       return;
     }
     try {
-      const { error } = await supabase.from('teams').insert({ name: newTeamName.trim() });
+      const track = newTeamTrack.replace(/\s+/g, ' ').trim() || null;
+      const { error } = await supabase.from('teams').insert({ name, track, display_order: teams.length });
       if (error) throw error;
       setNewTeamName('');
       await loadInitialData();
@@ -135,20 +155,27 @@ export default function SetupPage() {
     }
   };
 
-  const handleEditTeam = async (teamId: string, newName: string) => {
-    if (!newName.trim()) {
+  const handleEditTeam = async (teamId: string, newName: string, newTrack: string) => {
+    const name = newName.replace(/\s+/g, ' ').trim();
+    if (!name) {
       alert('يرجى إدخال اسم الفريق');
       return;
     }
-    if (teams.some(t => t.id !== teamId && t.name === newName.trim())) {
+    if (teams.some(t => t.id !== teamId && t.name.toLowerCase() === name.toLowerCase())) {
       alert('اسم الفريق موجود بالفعل');
       return;
     }
+    const oldName = teams.find(t => t.id === teamId)?.name;
     try {
-      const { error } = await supabase.from('teams').update({ name: newName.trim() }).eq('id', teamId);
+      const track = newTrack.replace(/\s+/g, ' ').trim() || null;
+      const { error } = await supabase.from('teams').update({ name, track }).eq('id', teamId);
       if (error) throw error;
       setEditingTeamId(null);
       setEditingTeamName('');
+      setEditingTeamTrack('');
+      if (oldName && oldName !== name) {
+        setSelectedTeams(prev => prev.map(t => (t === oldName ? name : t)));
+      }
       await loadInitialData();
     } catch (error) {
       console.error('Error updating team:', error);
@@ -176,10 +203,11 @@ export default function SetupPage() {
     newTeams.splice(toIndex, 0, movedTeam);
     setTeams(newTeams);
     try {
-      const updates = newTeams.map((team, index) =>
-        supabase.from('teams').update({ display_order: index }).eq('id', team.id)
+      // One request for the whole new order (was one request per team)
+      const { error } = await supabase.from('teams').upsert(
+        newTeams.map((team, index) => ({ id: team.id, name: team.name, track: team.track ?? null, display_order: index }))
       );
-      await Promise.all(updates);
+      if (error) throw error;
     } catch (error) {
       console.error('Error saving team order:', error);
       alert('خطأ في حفظ ترتيب الفرق');
@@ -193,6 +221,24 @@ export default function SetupPage() {
     );
   };
 
+  /** Tracks in list order ('' = teams without a track). */
+  const tracks = trackOrder(teams);
+  const namedTracks = tracks.filter(Boolean);
+  const teamsInTrack = (track: string) => teams.filter(t => (t.track ?? '') === track).map(t => t.name);
+
+  const toggleTrackSelection = (track: string) => {
+    const names = teamsInTrack(track);
+    const allSelected = names.every(n => selectedTeams.includes(n));
+    setSelectedTeams(prev => (allSelected
+      ? prev.filter(n => !names.includes(n))
+      : [...prev, ...names.filter(n => !prev.includes(n))]));
+  };
+
+  const handleTeamsUploaded = async (saved: SessionTeam[]) => {
+    await loadInitialData();
+    setSelectedTeams(saved.map(t => t.name));
+  };
+
   // ---- Step 2: questions ----
 
   const handleBankChange = (bankId: string) => {
@@ -203,42 +249,9 @@ export default function SetupPage() {
 
   // ---- Step 2 (optional): create a new question bank inline ----
 
-  const addNewBankQuestion = () => {
-    setNewBankQuestions(prev => [...prev, { text: '', choices: [{ text: '', weight: 1 }, { text: '', weight: 1 }] }]);
-  };
-
-  const removeNewBankQuestion = (index: number) => {
-    setNewBankQuestions(prev => prev.filter((_, i) => i !== index));
-  };
-
-  const updateNewBankQuestionText = (index: number, text: string) => {
-    setNewBankQuestions(prev => prev.map((q, i) => i === index ? { ...q, text } : q));
-  };
-
-  const updateNewBankChoiceText = (qIndex: number, cIndex: number, text: string) => {
-    setNewBankQuestions(prev => prev.map((q, i) => {
-      if (i !== qIndex) return q;
-      const choices = q.choices.map((c, ci) => ci === cIndex ? { ...c, text } : c);
-      return { ...q, choices };
-    }));
-  };
-
-  const addNewBankChoice = (qIndex: number) => {
-    setNewBankQuestions(prev => prev.map((q, i) =>
-      i === qIndex ? { ...q, choices: [...q.choices, { text: '', weight: 1 }] } : q
-    ));
-  };
-
-  const removeNewBankChoice = (qIndex: number) => {
-    setNewBankQuestions(prev => prev.map((q, i) => {
-      if (i !== qIndex || q.choices.length <= 1) return q;
-      return { ...q, choices: q.choices.slice(0, -1) };
-    }));
-  };
-
   const resetBankForm = () => {
     setNewBankName('');
-    setNewBankQuestions([{ text: '', choices: [{ text: '', weight: 1 }, { text: '', weight: 1 }] }]);
+    setNewBankSections([newSection(0)]);
   };
 
   const handleCreateBank = async () => {
@@ -246,44 +259,29 @@ export default function SetupPage() {
       alert('يرجى إدخال اسم بنك الأسئلة');
       return;
     }
-    const validQuestions = newBankQuestions.filter(q => q.text.trim() && q.choices.every(c => c.text.trim()));
-    if (validQuestions.length === 0) {
-      alert('أضف سؤالًا واحدًا على الأقل بنص وخيارات كاملة');
+    // Same checks as the questions page (the server checks again)
+    const problems = draftProblems(newBankSections);
+    if (problems.length > 0) {
+      alert(problems.slice(0, 12).join('\n') + (problems.length > 12 ? `\nو${problems.length - 12} ملاحظات أخرى` : ''));
       return;
     }
 
     setSavingBank(true);
     try {
-      const { data: bank, error: bankError } = await supabase
-        .from('question_banks')
-        .insert({ name: newBankName.trim() })
-        .select()
-        .single();
-      if (bankError) throw bankError;
-
-      const { data: insertedQuestions, error: questionsError } = await supabase
-        .from('questions')
-        .insert(validQuestions.map(q => ({
-          text: q.text.trim(),
-          choices: q.choices.map(c => ({ text: c.text.trim(), weight: c.weight })),
-          section: 'عام',
-          weight: 1,
-          bank_id: bank.id
-        })))
-        .select();
-      if (questionsError) throw questionsError;
+      // Bank, questions and choices are saved in one transaction: all or nothing
+      const bankId = await createQuestionBank(newBankName.trim(), draftToBankQuestions(newBankSections));
+      const inserted = await getQuestions(bankId);
 
       resetBankForm();
       setShowBankForm(false);
       await loadInitialData();
-      // New bank only contains what we just inserted — select it directly
-      // rather than re-deriving from `allQuestions`, which is still stale here.
-      setSelectedBank(bank.id);
-      setQuestions((insertedQuestions || []) as Question[]);
-      setSelectedQuestions((insertedQuestions || []).map(q => q.id));
+      // Select the new bank and all its questions directly: `allQuestions` is still stale here
+      setSelectedBank(bankId);
+      setQuestions(inserted);
+      setSelectedQuestions(inserted.map(q => q.id));
     } catch (error) {
       console.error('Error creating question bank:', error);
-      alert('خطأ في إنشاء بنك الأسئلة');
+      alert(`خطأ في إنشاء بنك الأسئلة: ${(error as { message?: string }).message ?? ''}`);
     } finally {
       setSavingBank(false);
     }
@@ -305,16 +303,19 @@ export default function SetupPage() {
     setCreating(true);
     try {
       const newSessionId = crypto.randomUUID().substring(0, 8);
-      // Keep the questions in the order they appear in the selected bank
-      const questionIds = questions.filter(q => selectedQuestions.includes(q.id)).map(q => q.id);
+      // Judges get the questions in the order the picker shows them (section by section)
+      const questionIds = orderBySection(questions).filter(q => selectedQuestions.includes(q.id)).map(q => q.id);
       const session = await createSession({
         name: `Session ${new Date().toISOString()}`,
         session_id: newSessionId,
         host_token: crypto.randomUUID(),
         host_id: user.id,
-        teams: selectedTeams,
+        // Judging order = list order (file order after an upload), with each team's track
+        teams: teams
+          .filter(t => selectedTeams.includes(t.name))
+          .map(t => ({ name: t.name, track: t.track ?? null })),
         questionIds,
-        total_points: 100
+        total_points: SESSION_TOTAL_POINTS
       });
       setSessionId(session.session_id);
     } catch (error) {
@@ -327,6 +328,20 @@ export default function SetupPage() {
 
   const judgeUrl = `${window.location.origin}/judge/${sessionId}`;
 
+  // Same split the server will use for the selected questions
+  const pickedQuestions = questions.filter(q => selectedQuestions.includes(q.id));
+  const pointsSplit = sectionPoints(pickedQuestions);
+  const pickedPoints = questionMaxPoints(pickedQuestions);
+  const allPicked = questions.length > 0 && questions.every(q => selectedQuestions.includes(q.id));
+
+  const toggleQuestion = (id: string) => {
+    setSelectedQuestions(prev => (prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]));
+  };
+
+  const toggleAllQuestions = () => {
+    setSelectedQuestions(allPicked ? [] : questions.map(q => q.id));
+  };
+
   const handleCopyLink = async () => {
     try {
       await navigator.clipboard.writeText(judgeUrl);
@@ -338,7 +353,17 @@ export default function SetupPage() {
     }
   };
 
-  const handleStartJudging = () => {
+  // Judges who joined wait on a "waiting" screen until this sets the first team.
+  // If it fails, the control page shows the same start button to retry.
+  const handleStartJudging = async () => {
+    setStarting(true);
+    try {
+      await startSession(sessionId);
+    } catch (e) {
+      console.error('Error starting session:', e);
+    } finally {
+      setStarting(false);
+    }
     navigate(`/host/${sessionId}/control`);
   };
 
@@ -405,12 +430,15 @@ export default function SetupPage() {
                 </span>
               )}
             </div>
-            <p className="card-desc">أضف الفرق المشاركة ثم حددها بالضغط عليها.</p>
+            <p className="card-desc">ارفع ملف الفرق مع مساراتها، أو أضف الفرق يدوياً، ثم حددها بالضغط عليها.</p>
+
+            {/* Upload teams + tracks from Excel */}
+            <TeamUploadPanel existingNames={teams.map(t => t.name)} onSaved={handleTeamsUploaded} />
 
             {/* Add Team Form */}
             <div className="panel panel--muted mb-5">
-              <label htmlFor="newTeamName">إضافة فريق جديد</label>
-              <div className="field-row">
+              <label htmlFor="newTeamName">إضافة فريق يدوياً</label>
+              <div className="field-row field-row--wrap">
                 <input
                   id="newTeamName"
                   type="text"
@@ -419,11 +447,24 @@ export default function SetupPage() {
                   onKeyDown={(e) => e.key === 'Enter' && handleAddTeam()}
                   placeholder="اسم الفريق"
                 />
+                <input
+                  id="newTeamTrack"
+                  type="text"
+                  list="trackOptions"
+                  value={newTeamTrack}
+                  onChange={(e) => setNewTeamTrack(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleAddTeam()}
+                  placeholder="المسار"
+                  className="field-row__track"
+                />
                 <button className="btn btn-primary" onClick={handleAddTeam}>
                   <Plus />
                   إضافة
                 </button>
               </div>
+              <datalist id="trackOptions">
+                {namedTracks.map(t => <option key={t} value={t} />)}
+              </datalist>
             </div>
 
             {/* Bulk Actions */}
@@ -437,6 +478,27 @@ export default function SetupPage() {
                 إلغاء الكل
               </button>
             </div>
+
+            {/* Select by track */}
+            {namedTracks.length > 0 && (
+              <div className="track-chips mb-4">
+                <span className="text-xs text-secondary">تحديد حسب المسار:</span>
+                {tracks.map(track => {
+                  const names = teamsInTrack(track);
+                  const chosen = names.filter(n => selectedTeams.includes(n)).length;
+                  const all = chosen === names.length;
+                  return (
+                    <button
+                      key={track || '__none'}
+                      className={`track-chip ${all ? 'track-chip--on' : chosen ? 'track-chip--some' : ''}`}
+                      onClick={() => toggleTrackSelection(track)}
+                    >
+                      {track || 'بدون مسار'} <b>{chosen}/{names.length}</b>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
 
             {/* Teams Grid */}
             <div
@@ -453,7 +515,7 @@ export default function SetupPage() {
                 <div className="empty-state" style={{ gridColumn: '1 / -1' }}>
                   <Users />
                   <h3>لا توجد فرق بعد</h3>
-                  <p>أضف أول فريق من الحقل أعلاه</p>
+                  <p>ارفع ملف الفرق أو أضف أول فريق يدوياً</p>
                 </div>
               )}
               {teams.map((team, index) => {
@@ -480,7 +542,7 @@ export default function SetupPage() {
                           value={editingTeamName}
                           onChange={(e) => setEditingTeamName(e.target.value)}
                           onKeyDown={(e) => {
-                            if (e.key === 'Enter') handleEditTeam(team.id, editingTeamName);
+                            if (e.key === 'Enter') handleEditTeam(team.id, editingTeamName, editingTeamTrack);
                             if (e.key === 'Escape') { setEditingTeamId(null); setEditingTeamName(''); }
                           }}
                           onClick={(e) => e.stopPropagation()}
@@ -491,6 +553,24 @@ export default function SetupPage() {
                         <span className="team-tile__name">{team.name}</span>
                       )}
                     </div>
+                    {isEditing ? (
+                      <input
+                        type="text"
+                        list="trackOptions"
+                        value={editingTeamTrack}
+                        onChange={(e) => setEditingTeamTrack(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') handleEditTeam(team.id, editingTeamName, editingTeamTrack);
+                          if (e.key === 'Escape') { setEditingTeamId(null); setEditingTeamName(''); }
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                        placeholder="المسار"
+                        className="mb-2"
+                        style={{ padding: '4px 8px', fontSize: '13px' }}
+                      />
+                    ) : team.track ? (
+                      <div className="mb-2"><span className="track-badge">{team.track}</span></div>
+                    ) : null}
 
                     <div className="team-tile__actions" onClick={(e) => e.stopPropagation()}>
                       <div>
@@ -513,14 +593,14 @@ export default function SetupPage() {
                       <div>
                         {isEditing ? (
                           <>
-                            <button className="icon-btn icon-btn--success" onClick={() => handleEditTeam(team.id, editingTeamName)} title="حفظ" aria-label="حفظ"><Check /></button>
+                            <button className="icon-btn icon-btn--success" onClick={() => handleEditTeam(team.id, editingTeamName, editingTeamTrack)} title="حفظ" aria-label="حفظ"><Check /></button>
                             <button className="icon-btn icon-btn--danger" onClick={() => { setEditingTeamId(null); setEditingTeamName(''); }} title="إلغاء" aria-label="إلغاء"><X /></button>
                           </>
                         ) : (
                           <>
                             <button
                               className={`icon-btn ${isSelected ? 'icon-btn--on-primary' : ''}`}
-                              onClick={() => { setEditingTeamId(team.id); setEditingTeamName(team.name); }}
+                              onClick={() => { setEditingTeamId(team.id); setEditingTeamName(team.name); setEditingTeamTrack(team.track ?? ''); }}
                               title="تعديل"
                               aria-label="تعديل"
                             ><Pencil /></button>
@@ -579,53 +659,9 @@ export default function SetupPage() {
                     />
                   </div>
 
-                  {newBankQuestions.map((q, qIdx) => (
-                    <div key={qIdx} className="panel mb-3">
-                      <div className="field-row mb-2" style={{ alignItems: 'flex-start' }}>
-                        <textarea
-                          value={q.text}
-                          onChange={(e) => updateNewBankQuestionText(qIdx, e.target.value)}
-                          placeholder={`نص السؤال ${qIdx + 1}`}
-                          style={{ minHeight: '50px' }}
-                        />
-                        {newBankQuestions.length > 1 && (
-                          <button className="icon-btn icon-btn--danger" onClick={() => removeNewBankQuestion(qIdx)} title="حذف السؤال" aria-label="حذف السؤال">
-                            <Trash2 />
-                          </button>
-                        )}
-                      </div>
-                      {q.choices.map((c, cIdx) => (
-                        <div key={cIdx} className="field-row mb-2">
-                          <span className="choice-chip__bullet" />
-                          <input
-                            type="text"
-                            value={c.text}
-                            onChange={(e) => updateNewBankChoiceText(qIdx, cIdx, e.target.value)}
-                            placeholder={`خيار ${cIdx + 1}`}
-                            style={{ padding: '6px 10px', fontSize: '13px' }}
-                          />
-                        </div>
-                      ))}
-                      <div className="flex gap-2">
-                        <button className="btn btn-secondary btn-sm" onClick={() => addNewBankChoice(qIdx)}>
-                          <Plus />
-                          خيار
-                        </button>
-                        {q.choices.length > 1 && (
-                          <button className="btn btn-secondary btn-sm" onClick={() => removeNewBankChoice(qIdx)}>
-                            <Minus />
-                            خيار
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  ))}
+                  <QuestionBankEditor sections={newBankSections} onChange={setNewBankSections} compact />
 
                   <div className="flex gap-2">
-                    <button className="btn btn-secondary flex-1" onClick={addNewBankQuestion}>
-                      <Plus />
-                      إضافة سؤال آخر
-                    </button>
                     <button className="btn btn-primary flex-1" onClick={handleCreateBank} disabled={savingBank}>
                       {savingBank ? <Loader2 className="spin" /> : <Save />}
                       {savingBank ? 'جاري الحفظ...' : 'حفظ البنك'}
@@ -650,22 +686,46 @@ export default function SetupPage() {
             </div>
 
             <div className="field">
-              <label htmlFor="questionSelect">اختر الأسئلة</label>
-              <select
-                id="questionSelect"
-                multiple
-                value={selectedQuestions}
-                onChange={(e) => {
-                  const selected = Array.from(e.target.selectedOptions, option => option.value);
-                  setSelectedQuestions(selected);
-                }}
-              >
-                {questions.map(question => (
-                  <option key={question.id} value={question.id}>{question.text}</option>
-                ))}
-              </select>
-              <p className="text-xs text-secondary mt-2">اضغط مع الاستمرار على Ctrl أو لتحديد أكثر من سؤال.</p>
+              <div className="flex items-center justify-between gap-2 mb-2">
+                <label style={{ margin: 0 }}>اختر الأسئلة</label>
+                {questions.length > 0 && (
+                  <button className="btn btn-ghost btn-sm" onClick={toggleAllQuestions}>
+                    {allPicked ? <X /> : <CheckCheck />}
+                    {allPicked ? 'إلغاء تحديد الكل' : 'تحديد الكل'}
+                  </button>
+                )}
+              </div>
+              {questions.length === 0 ? (
+                <div className="empty-state">
+                  <HelpCircle />
+                  <p>لا توجد أسئلة في هذا البنك</p>
+                </div>
+              ) : (
+                <div className="question-picker">
+                  <QuestionList
+                    questions={questions}
+                    selectedIds={selectedQuestions}
+                    onToggle={toggleQuestion}
+                    points={pickedPoints}
+                  />
+                </div>
+              )}
             </div>
+
+            {pointsSplit.length > 0 && (
+              <div className="panel panel--muted">
+                <div className="fw-600 mb-2">توزيع الدرجة ({SESSION_TOTAL_POINTS} لكل محكم)</div>
+                <ul className="points-split">
+                  {pointsSplit.map((r) => (
+                    <li key={r.section}>
+                      <span>{r.section} <span className="text-secondary">({r.questions} {r.questions === 1 ? 'سؤال' : 'أسئلة'})</span></span>
+                      <span className="fw-700">{r.points.toFixed(2)}</span>
+                    </li>
+                  ))}
+                </ul>
+                <p className="text-xs text-secondary mt-2 mb-0">نتيجة الفريق متوسط درجات المحكمين، فلا تتجاوز {SESSION_TOTAL_POINTS} مهما كان عددهم.</p>
+              </div>
+            )}
           </div>
 
           {/* ============ STEP 3: JUDGES ============ */}
@@ -744,13 +804,17 @@ export default function SetupPage() {
                     )}
                   </ul>
 
-                  <button className="btn btn-primary btn-lg btn-block mt-3" onClick={handleStartJudging}>
-                    <Play />
+                  <button className="btn btn-primary btn-lg btn-block mt-3" onClick={handleStartJudging} disabled={starting}>
+                    {starting ? <Loader2 className="spin" /> : <Play />}
                     بدء جلسة التحكيم {judges.length > 0 ? `(${judges.length} محكم)` : ''}
                   </button>
-                  {judges.length === 0 && (
+                  {judges.length === 0 ? (
                     <p className="text-sm text-warning text-center mt-2 mb-0">
                       يمكنك البدء الآن والمحكمون ينضمون لاحقًا، لكن يُفضّل انتظار انضمامهم
+                    </p>
+                  ) : (
+                    <p className="text-sm text-secondary text-center mt-2 mb-0">
+                      المحكمون في شاشة الانتظار، ولن يظهر لهم الفريق الأول حتى تضغط بدء
                     </p>
                   )}
                 </div>
