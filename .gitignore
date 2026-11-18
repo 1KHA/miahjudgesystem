@@ -55,3 +55,4 @@ stress/*.log
 visual_identity_dar
 vi_inmaa
 db_backup
+supabase
